@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""MCP-side world server with private world model and memory."""
+"""MCP-side world server with private world model and memory.
+
+Can be used in two ways:
+1) Imported as a Python module by `simulation_mcp_experiment.py`.
+2) Launched as an MCP stdio server process (for LM Studio bridge).
+"""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Any, Dict, List, Literal
 from urllib import error, request
 
 ActionName = Literal["look", "move", "pickup", "drop", "say", "status"]
@@ -49,7 +57,6 @@ class WorldState:
 
 class LLMResponsesClient:
     def __init__(self, base_url: str, model: str, timeout_s: int = 1800) -> None:
-
         self.url = f"{base_url.rstrip('/')}/responses"
         self.model = model
         self.timeout_s = timeout_s
@@ -203,3 +210,167 @@ class MCPWorldServer:
 
     def call_tool(self, robot: RobotState, tool: ToolCall) -> str:
         return self.world_model.handle_tool_call(robot, tool)
+
+
+class MCPStdioBridge:
+    """Minimal JSON-RPC MCP server for LM Studio MCP bridge."""
+
+    def __init__(self, server: MCPWorldServer) -> None:
+        self.server = server
+        self.robot = RobotState()
+
+    def run(self) -> None:
+        while True:
+            msg = self._read_message()
+            if msg is None:
+                break
+            self._handle_message(msg)
+
+    def _handle_message(self, msg: Dict[str, Any]) -> None:
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        params = msg.get("params", {})
+
+        if method == "initialize":
+            self._send_result(
+                msg_id,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "robot-world-bridge", "version": "0.1.0"},
+                },
+            )
+            return
+
+        if method == "notifications/initialized":
+            return
+
+        if method == "tools/list":
+            self._send_result(msg_id, {"tools": self._tools_schema()})
+            return
+
+        if method == "tools/call":
+            name = str(params.get("name", "look"))
+            args_raw = params.get("arguments", {})
+            if not isinstance(args_raw, dict):
+                args_raw = {}
+            args = {str(k): str(v) for k, v in args_raw.items()}
+            tool_call = ToolCall(name=name if name in {"look", "move", "pickup", "drop", "say", "status"} else "look", args=args)
+            text = self.server.call_tool(self.robot, tool_call)
+            self._send_result(msg_id, {"content": [{"type": "text", "text": text}]})
+            return
+
+        self._send_error(msg_id, -32601, f"Method not found: {method}")
+
+    @staticmethod
+    def _tools_schema() -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "look",
+                "description": "Inspect current location",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "move",
+                "description": "Move to neighboring location",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"to": {"type": "string"}},
+                    "required": ["to"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "pickup",
+                "description": "Pick item in current location",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"item": {"type": "string"}},
+                    "required": ["item"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "drop",
+                "description": "Drop carried item",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"item": {"type": "string"}},
+                    "required": ["item"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "say",
+                "description": "Say phrase via robot speaker",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "status",
+                "description": "Get robot status",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        ]
+
+    @staticmethod
+    def _read_message() -> Dict[str, Any] | None:
+        headers: Dict[str, str] = {}
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return None
+            if line in (b"\r\n", b"\n"):
+                break
+            key, value = line.decode("utf-8").split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+        length = int(headers.get("content-length", "0"))
+        if length <= 0:
+            return None
+        body = sys.stdin.buffer.read(length)
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+
+    @staticmethod
+    def _send_message(payload: Dict[str, Any]) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+
+    def _send_result(self, msg_id: Any, result: Dict[str, Any]) -> None:
+        self._send_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+    def _send_error(self, msg_id: Any, code: int, message: str) -> None:
+        self._send_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
+
+
+def build_world_server_from_env() -> MCPWorldServer:
+    base_url = os.getenv("WORLD_MODEL_BASE_URL", "http://127.0.0.1:1234/v1")
+    model_name = os.getenv("WORLD_MODEL_NAME", "world-model")
+    memory_path = os.getenv("WORLD_MEMORY_PATH", "world_memory.jsonl")
+    timeout_s = int(os.getenv("WORLD_TIMEOUT_S", "1800"))
+    llm = LLMResponsesClient(base_url=base_url, model=model_name, timeout_s=timeout_s)
+    memory = LongTermMemory(memory_path)
+    model = WorldModel(llm, memory)
+    return MCPWorldServer(model)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run MCP world bridge over stdio")
+    parser.add_argument("--stdio", action="store_true", help="Run MCP JSON-RPC stdio server")
+    args = parser.parse_args()
+
+    if args.stdio:
+        bridge = MCPStdioBridge(build_world_server_from_env())
+        bridge.run()
+
+
+if __name__ == "__main__":
+    main()
