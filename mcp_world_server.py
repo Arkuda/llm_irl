@@ -48,7 +48,8 @@ class WorldState:
 
 
 class LLMResponsesClient:
-    def __init__(self, base_url: str, model: str, timeout_s: int = 60) -> None:
+    def __init__(self, base_url: str, model: str, timeout_s: int = 1800) -> None:
+
         self.url = f"{base_url.rstrip('/')}/responses"
         self.model = model
         self.timeout_s = timeout_s

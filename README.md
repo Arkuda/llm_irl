@@ -61,4 +61,6 @@ python simulation_mcp_experiment.py \
 
 > Где `mcp_world_server.py` — серверная часть со второй моделью, которая поднимает MCP tools (`look/move/pickup/drop/say/status`) и крутит world-логику.
 
----
+## Таймауты запросов
+
+По умолчанию timeout HTTP-запроса к локальному `/responses` теперь **30 минут** (1800 секунд), чтобы большие локальные модели успевали догенерить ответ.
